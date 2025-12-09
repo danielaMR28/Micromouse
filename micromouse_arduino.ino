@@ -1,470 +1,245 @@
-// Micromouse con Arduino
-// Control de motores con encoders, sensores ultrasónicos y comunicación Bluetooth
+/*
+ * Micromouse con corrección de deriva usando giroscopio
+ * - Giros de 90° calibrados
+ * - Avance recto con corrección automática
+ */
 
-// === CONFIGURACIÓN DE PINES ===
+#include <Wire.h>
 
-// Motores (conectados al puente H)
-#define MOTOR_LEFT_ENABLE 5   // PWM para velocidad motor izquierdo
-#define MOTOR_LEFT_DIR1 4     // Dirección 1 motor izquierdo
-#define MOTOR_LEFT_DIR2 3     // Dirección 2 motor izquierdo
+#define ENA 9
+#define IN1 7
+#define IN2 8
+#define ENB 10
+#define IN3 4
+#define IN4 5
 
-#define MOTOR_RIGHT_ENABLE 6  // PWM para velocidad motor derecho
-#define MOTOR_RIGHT_DIR1 7    // Dirección 1 motor derecho
-#define MOTOR_RIGHT_DIR2 8    // Dirección 2 motor derecho
+#define TRIG_FRONT 11
+#define ECHO_FRONT 12
+#define TRIG_LEFT A0
+#define ECHO_LEFT A1
+#define TRIG_RIGHT A2
+#define ECHO_RIGHT A3
 
-// Encoders
-#define ENCODER_LEFT_A 2      // Pin interrupción encoder izquierdo
-#define ENCODER_LEFT_B 9      // Pin B encoder izquierdo
-#define ENCODER_RIGHT_A 3     // Pin interrupción encoder derecho
-#define ENCODER_RIGHT_B 10    // Pin B encoder derecho
+const int MPU = 0x68;
+const int TURN_SPEED = 100;
+const int SPEED_NORMAL = 100;
+const int MOTOR_OFFSET = 5;
+const int FRONT_STOP = 8;
+const int MAX_SIDE_DISTANCE = 12;
 
-// Sensores ultrasónicos
-#define TRIGGER_FRONT 11      // Trigger sensor frontal
-#define ECHO_FRONT 12         // Echo sensor frontal
-#define TRIGGER_LEFT A0       // Trigger sensor izquierdo
-#define ECHO_LEFT A1          // Echo sensor izquierdo
-#define TRIGGER_RIGHT A2      // Trigger sensor derecho
-#define ECHO_RIGHT A3         // Echo sensor derecho
+// Ángulo para giros de 90° (ajustar según pruebas: 35-45)
+const int TURN_ANGLE = 38;
 
-// === VARIABLES GLOBALES ===
+// Factor de corrección para ir recto (ajustar: 2-5)
+const float CORRECTION_FACTOR = 3.0;
 
-// Control de motores
-int baseSpeed = 150;          // Velocidad base (0-255)
-int turnSpeed = 120;          // Velocidad para giros
-
-// Encoders
-volatile long encoderLeftCount = 0;
-volatile long encoderRightCount = 0;
-long lastEncoderLeft = 0;
-long lastEncoderRight = 0;
-
-// Distancias de sensores (en cm)
-float distanceFront = 0;
-float distanceLeft = 0;
-float distanceRight = 0;
-
-// Control de movimiento
-const int PULSES_PER_CELL = 200;  // Pulsos del encoder por celda del laberinto
-const int PULSES_PER_TURN = 100;  // Pulsos para un giro de 90 grados
-
-// Comunicación
-String inputCommand = "";
-bool commandComplete = false;
-
-// Estado del robot
-enum RobotState {
-  IDLE,
-  MOVING_FORWARD,
-  TURNING_LEFT,
-  TURNING_RIGHT,
-  READING_SENSORS
-};
-
-RobotState currentState = IDLE;
-
-// === FUNCIONES DE CONFIGURACIÓN ===
+float yaw = 0;
+float gyroZ_offset = 0;
+unsigned long lastTime;
+bool straightInitialized = false;
 
 void setup() {
-  // Inicializar comunicación serial para Bluetooth
   Serial.begin(9600);
   
-  // Configurar pines de motores
-  pinMode(MOTOR_LEFT_ENABLE, OUTPUT);
-  pinMode(MOTOR_LEFT_DIR1, OUTPUT);
-  pinMode(MOTOR_LEFT_DIR2, OUTPUT);
-  pinMode(MOTOR_RIGHT_ENABLE, OUTPUT);
-  pinMode(MOTOR_RIGHT_DIR1, OUTPUT);
-  pinMode(MOTOR_RIGHT_DIR2, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(TRIG_FRONT, OUTPUT); pinMode(ECHO_FRONT, INPUT);
+  pinMode(TRIG_LEFT, OUTPUT);  pinMode(ECHO_LEFT, INPUT);
+  pinMode(TRIG_RIGHT, OUTPUT); pinMode(ECHO_RIGHT, INPUT);
   
-  // Configurar pines de encoders
-  pinMode(ENCODER_LEFT_A, INPUT_PULLUP);
-  pinMode(ENCODER_LEFT_B, INPUT_PULLUP);
-  pinMode(ENCODER_RIGHT_A, INPUT_PULLUP);
-  pinMode(ENCODER_RIGHT_B, INPUT_PULLUP);
+  Wire.begin();
+  Wire.beginTransmission(MPU);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
   
-  // Configurar interrupciones para encoders
-  attachInterrupt(digitalPinToInterrupt(ENCODER_LEFT_A), encoderLeftISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT_A), encoderRightISR, CHANGE);
+  Serial.println("Calibrando gyro...");
+  delay(2000);
   
-  // Configurar pines de sensores ultrasónicos
-  pinMode(TRIGGER_FRONT, OUTPUT);
-  pinMode(ECHO_FRONT, INPUT);
-  pinMode(TRIGGER_LEFT, OUTPUT);
-  pinMode(ECHO_LEFT, INPUT);
-  pinMode(TRIGGER_RIGHT, OUTPUT);
-  pinMode(ECHO_RIGHT, INPUT);
+  float suma = 0;
+  for (int i = 0; i < 1000; i++) {
+    Wire.beginTransmission(MPU);
+    Wire.write(0x47);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU, 2, true);
+    int16_t gz = Wire.read() << 8 | Wire.read();
+    suma += gz;
+    delay(1);
+  }
+  gyroZ_offset = suma / 1000.0;
   
-  // Detener motores al inicio
+  Serial.println("Listo! Inicia en 3 seg...");
+  delay(3000);
+  
+  // Inicializar para el primer tramo recto
+  resetStraightDrive();
+}
+
+void loop() {
+  int distFront = getDistance(TRIG_FRONT, ECHO_FRONT);
+  int distLeft = getDistance(TRIG_LEFT, ECHO_LEFT);
+  int distRight = getDistance(TRIG_RIGHT, ECHO_RIGHT);
+  
+  bool wallFront = (distFront <= FRONT_STOP) && (distFront > 0);
+  bool wallLeft = (distLeft < MAX_SIDE_DISTANCE) && (distLeft > 0);
+  bool wallRight = (distRight < MAX_SIDE_DISTANCE) && (distRight > 0);
+  
+  Serial.print("F:"); Serial.print(distFront);
+  Serial.print(" L:"); Serial.print(distLeft);
+  Serial.print(" R:"); Serial.print(distRight);
+  Serial.print(" Yaw:"); Serial.print(yaw);
+  Serial.print(" | wF:"); Serial.println(wallFront);
+  
+  if (wallFront) {
+    stopMotors();
+    delay(200);
+    
+    // Volver a medir lados después de detenerse
+    distLeft = getDistance(TRIG_LEFT, ECHO_LEFT);
+    distRight = getDistance(TRIG_RIGHT, ECHO_RIGHT);
+    wallLeft = (distLeft < MAX_SIDE_DISTANCE) && (distLeft > 0);
+    wallRight = (distRight < MAX_SIDE_DISTANCE) && (distRight > 0);
+    
+    if (!wallRight) {
+      Serial.println("-> GIRO DER");
+      turnRight90();
+      resetStraightDrive();
+    } 
+    else if (!wallLeft) {
+      Serial.println("-> GIRO IZQ");
+      turnLeft90();
+      resetStraightDrive();
+    }
+    else {
+      Serial.println("-> MEDIA VUELTA");
+      turnLeft90();
+      turnLeft90();
+      resetStraightDrive();
+    }
+  }
+  else {
+    driveForwardStraight();
+  }
+  
+  delay(50);
+}
+
+// Avanzar recto con corrección de deriva
+void driveForwardStraight() {
+  updateGyro();
+  
+  // Corrección proporcional basada en la desviación
+  int correccion = yaw * CORRECTION_FACTOR;
+  
+  int velIzq = SPEED_NORMAL + correccion;
+  int velDer = (SPEED_NORMAL - MOTOR_OFFSET) - correccion;
+  
+  // Limitar valores para no pasarse
+  velIzq = constrain(velIzq, 60, 150);
+  velDer = constrain(velDer, 60, 150);
+  
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, velIzq);
+  analogWrite(ENB, velDer);
+  
+  // Debug opcional
+  // Serial.print(" VelI:"); Serial.print(velIzq);
+  // Serial.print(" VelD:"); Serial.println(velDer);
+}
+
+// Resetear el ángulo después de cada giro
+void resetStraightDrive() {
+  yaw = 0;
+  lastTime = micros();
+  straightInitialized = true;
+}
+
+void turnRight90() {
+  yaw = 0;
+  lastTime = micros();
+  
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, TURN_SPEED);
+  analogWrite(ENB, TURN_SPEED);
+  
+  while (yaw > -TURN_ANGLE) {
+    updateGyro();
+    delay(5);
+  }
+  
   stopMotors();
+  delay(200);
   
-  Serial.println("Micromouse iniciado");
-  Serial.println("Comandos disponibles:");
-  Serial.println("F - Avanzar una celda");
-  Serial.println("L - Girar 90° izquierda");
-  Serial.println("R - Girar 90° derecha");
-  Serial.println("S - Leer sensores");
-  Serial.println("H - Detener");
+  // Avanzar un poco después del giro
+  driveForward();
+  delay(300);
+  stopMotors();
 }
 
-// === FUNCIONES DE INTERRUPCIÓN PARA ENCODERS ===
-
-void encoderLeftISR() {
-  // Leer el estado del pin B para determinar dirección
-  if (digitalRead(ENCODER_LEFT_B) == digitalRead(ENCODER_LEFT_A)) {
-    encoderLeftCount++;
-  } else {
-    encoderLeftCount--;
+void turnLeft90() {
+  yaw = 0;
+  lastTime = micros();
+  
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, TURN_SPEED);
+  analogWrite(ENB, TURN_SPEED);
+  
+  while (yaw < TURN_ANGLE) {
+    updateGyro();
+    delay(5);
   }
+  
+  stopMotors();
+  delay(200);
+  
+  // Avanzar un poco después del giro
+  driveForward();
+  delay(300);
+  stopMotors();
 }
 
-void encoderRightISR() {
-  // Leer el estado del pin B para determinar dirección
-  if (digitalRead(ENCODER_RIGHT_B) != digitalRead(ENCODER_RIGHT_A)) {
-    encoderRightCount++;
-  } else {
-    encoderRightCount--;
-  }
+// Avance simple (sin corrección, usado después de giros)
+void driveForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, SPEED_NORMAL);
+  analogWrite(ENB, SPEED_NORMAL - MOTOR_OFFSET);
 }
 
-// === FUNCIONES DE CONTROL DE MOTORES ===
-
-void setMotorLeft(int speed) {
-  if (speed > 0) {
-    digitalWrite(MOTOR_LEFT_DIR1, HIGH);
-    digitalWrite(MOTOR_LEFT_DIR2, LOW);
-    analogWrite(MOTOR_LEFT_ENABLE, speed);
-  } else if (speed < 0) {
-    digitalWrite(MOTOR_LEFT_DIR1, LOW);
-    digitalWrite(MOTOR_LEFT_DIR2, HIGH);
-    analogWrite(MOTOR_LEFT_ENABLE, -speed);
-  } else {
-    digitalWrite(MOTOR_LEFT_DIR1, LOW);
-    digitalWrite(MOTOR_LEFT_DIR2, LOW);
-    analogWrite(MOTOR_LEFT_ENABLE, 0);
-  }
+void updateGyro() {
+  Wire.beginTransmission(MPU);
+  Wire.write(0x47);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU, 2, true);
+  int16_t gz = Wire.read() << 8 | Wire.read();
+  
+  float gyroZ = (gz - gyroZ_offset) / 131.0;
+  
+  unsigned long now = micros();
+  float dt = (now - lastTime) / 1000000.0;
+  lastTime = now;
+  
+  yaw += gyroZ * dt;
 }
 
-void setMotorRight(int speed) {
-  if (speed > 0) {
-    digitalWrite(MOTOR_RIGHT_DIR1, HIGH);
-    digitalWrite(MOTOR_RIGHT_DIR2, LOW);
-    analogWrite(MOTOR_RIGHT_ENABLE, speed);
-  } else if (speed < 0) {
-    digitalWrite(MOTOR_RIGHT_DIR1, LOW);
-    digitalWrite(MOTOR_RIGHT_DIR2, HIGH);
-    analogWrite(MOTOR_RIGHT_ENABLE, -speed);
-  } else {
-    digitalWrite(MOTOR_RIGHT_DIR1, LOW);
-    digitalWrite(MOTOR_RIGHT_DIR2, LOW);
-    analogWrite(MOTOR_RIGHT_ENABLE, 0);
-  }
+int getDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  long duration = pulseIn(echoPin, HIGH, 15000);
+  
+  if (duration == 0) return 999;
+  return duration * 0.034 / 2;
 }
 
 void stopMotors() {
-  setMotorLeft(0);
-  setMotorRight(0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW); analogWrite(ENA, 0);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW); analogWrite(ENB, 0);
 }
 
-// === FUNCIONES DE MOVIMIENTO ===
-
-void moveForward() {
-  // Reiniciar contadores de encoder
-  encoderLeftCount = 0;
-  encoderRightCount = 0;
-  
-  currentState = MOVING_FORWARD;
-  
-  // Mover hacia adelante hasta completar una celda
-  while (abs(encoderLeftCount) < PULSES_PER_CELL && 
-         abs(encoderRightCount) < PULSES_PER_CELL) {
-    
-    // Control PID simple para mantener recta la trayectoria
-    int error = encoderLeftCount - encoderRightCount;
-    int correction = error * 2; // Ganancia proporcional
-    
-    setMotorLeft(baseSpeed - correction);
-    setMotorRight(baseSpeed + correction);
-    
-    // Verificar si hay obstáculos mientras avanza
-    readSensors();
-    if (distanceFront < 5) { // Si hay pared muy cerca
-      stopMotors();
-      break;
-    }
-    
-    delay(10);
-  }
-  
-  stopMotors();
-  currentState = IDLE;
-  
-  Serial.println("MOVE_COMPLETE");
-}
-
-void turnLeft() {
-  // Reiniciar contadores
-  encoderLeftCount = 0;
-  encoderRightCount = 0;
-  
-  currentState = TURNING_LEFT;
-  
-  // Girar rueda derecha hacia adelante, izquierda hacia atrás
-  while (abs(encoderRightCount) < PULSES_PER_TURN) {
-    setMotorLeft(-turnSpeed);
-    setMotorRight(turnSpeed);
-    delay(10);
-  }
-  
-  stopMotors();
-  currentState = IDLE;
-  
-  Serial.println("TURN_COMPLETE");
-}
-
-void turnRight() {
-  // Reiniciar contadores
-  encoderLeftCount = 0;
-  encoderRightCount = 0;
-  
-  currentState = TURNING_RIGHT;
-  
-  // Girar rueda izquierda hacia adelante, derecha hacia atrás
-  while (abs(encoderLeftCount) < PULSES_PER_TURN) {
-    setMotorLeft(turnSpeed);
-    setMotorRight(-turnSpeed);
-    delay(10);
-  }
-  
-  stopMotors();
-  currentState = IDLE;
-  
-  Serial.println("TURN_COMPLETE");
-}
-
-// === FUNCIONES DE SENSORES ===
-
-float readUltrasonic(int triggerPin, int echoPin) {
-  // Generar pulso de trigger
-  digitalWrite(triggerPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(triggerPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(triggerPin, LOW);
-  
-  // Leer duración del pulso echo
-  long duration = pulseIn(echoPin, HIGH, 30000); // Timeout de 30ms
-  
-  // Calcular distancia en cm
-  float distance = duration * 0.034 / 2;
-  
-  // Limitar a rango válido
-  if (distance == 0 || distance > 400) {
-    distance = 400;
-  }
-  
-  return distance;
-}
-
-void readSensors() {
-  distanceFront = readUltrasonic(TRIGGER_FRONT, ECHO_FRONT);
-  distanceLeft = readUltrasonic(TRIGGER_LEFT, ECHO_LEFT);
-  distanceRight = readUltrasonic(TRIGGER_RIGHT, ECHO_RIGHT);
-}
-
-void sendSensorData() {
-  readSensors();
-  
-  // Convertir distancias a detección de pared (1 = pared, 0 = sin pared)
-  int wallFront = (distanceFront < 15) ? 1 : 0;
-  int wallLeft = (distanceLeft < 15) ? 1 : 0;
-  int wallRight = (distanceRight < 15) ? 1 : 0;
-  
-  // Enviar datos en formato: SENSORS:left,front,right
-  String sensorData = "SENSORS:" + String(wallLeft) + "," + 
-                      String(wallFront) + "," + String(wallRight);
-  Serial.println(sensorData);
-  
-  // También enviar distancias reales para debug
-  String debugData = "DISTANCES:" + String(distanceLeft, 1) + "," + 
-                     String(distanceFront, 1) + "," + String(distanceRight, 1);
-  Serial.println(debugData);
-}
-
-// === FUNCIÓN PRINCIPAL ===
-
-void loop() {
-  // Procesar comandos recibidos por Bluetooth
-  if (commandComplete) {
-    processCommand();
-    inputCommand = "";
-    commandComplete = false;
-  }
-  
-  // Leer datos del puerto serial (Bluetooth)
-  while (Serial.available()) {
-    char inChar = (char)Serial.read();
-    
-    if (inChar == '\n') {
-      commandComplete = true;
-    } else {
-      inputCommand += inChar;
-    }
-  }
-  
-  // Actualizar estado si es necesario
-  if (currentState == IDLE) {
-    // Enviar datos de sensores periódicamente cuando está inactivo
-    static unsigned long lastSensorUpdate = 0;
-    if (millis() - lastSensorUpdate > 500) {
-      sendSensorData();
-      lastSensorUpdate = millis();
-    }
-  }
-}
-
-// === PROCESAMIENTO DE COMANDOS ===
-
-void processCommand() {
-  inputCommand.trim(); // Eliminar espacios en blanco
-  
-  if (inputCommand == "F") {
-    Serial.println("Avanzando...");
-    moveForward();
-  }
-  else if (inputCommand == "L") {
-    Serial.println("Girando izquierda...");
-    turnLeft();
-  }
-  else if (inputCommand == "R") {
-    Serial.println("Girando derecha...");
-    turnRight();
-  }
-  else if (inputCommand == "S") {
-    Serial.println("Leyendo sensores...");
-    sendSensorData();
-  }
-  else if (inputCommand == "H") {
-    Serial.println("Deteniendo...");
-    stopMotors();
-    currentState = IDLE;
-  }
-  else if (inputCommand == "TEST") {
-    // Modo de prueba
-    testMotors();
-  }
-  else if (inputCommand.startsWith("SPEED:")) {
-    // Ajustar velocidad: SPEED:150
-    int newSpeed = inputCommand.substring(6).toInt();
-    if (newSpeed >= 0 && newSpeed <= 255) {
-      baseSpeed = newSpeed;
-      Serial.println("Velocidad ajustada a: " + String(baseSpeed));
-    }
-  }
-  else if (inputCommand == "STATUS") {
-    // Enviar estado actual
-    sendStatus();
-  }
-  else {
-    Serial.println("Comando desconocido: " + inputCommand);
-  }
-}
-
-// === FUNCIONES DE PRUEBA Y DEBUG ===
-
-void testMotors() {
-  Serial.println("=== PRUEBA DE MOTORES ===");
-  
-  // Probar motor izquierdo
-  Serial.println("Motor izquierdo adelante...");
-  setMotorLeft(150);
-  delay(1000);
-  setMotorLeft(0);
-  delay(500);
-  
-  Serial.println("Motor izquierdo atrás...");
-  setMotorLeft(-150);
-  delay(1000);
-  setMotorLeft(0);
-  delay(500);
-  
-  // Probar motor derecho
-  Serial.println("Motor derecho adelante...");
-  setMotorRight(150);
-  delay(1000);
-  setMotorRight(0);
-  delay(500);
-  
-  Serial.println("Motor derecho atrás...");
-  setMotorRight(-150);
-  delay(1000);
-  setMotorRight(0);
-  delay(500);
-  
-  // Probar ambos motores
-  Serial.println("Ambos motores adelante...");
-  setMotorLeft(150);
-  setMotorRight(150);
-  delay(1000);
-  stopMotors();
-  
-  Serial.println("=== PRUEBA COMPLETADA ===");
-}
-
-void sendStatus() {
-  String status = "STATUS:";
-  
-  // Estado actual
-  switch(currentState) {
-    case IDLE:
-      status += "IDLE,";
-      break;
-    case MOVING_FORWARD:
-      status += "MOVING,";
-      break;
-    case TURNING_LEFT:
-      status += "TURN_L,";
-      break;
-    case TURNING_RIGHT:
-      status += "TURN_R,";
-      break;
-    case READING_SENSORS:
-      status += "READING,";
-      break;
-  }
-  
-  // Contadores de encoders
-  status += "ENC_L:" + String(encoderLeftCount) + ",";
-  status += "ENC_R:" + String(encoderRightCount) + ",";
-  
-  // Velocidad actual
-  status += "SPEED:" + String(baseSpeed);
-  
-  Serial.println(status);
-}
-
-// === FUNCIONES AUXILIARES ===
-
-void calibrateSensors() {
-  Serial.println("=== CALIBRACIÓN DE SENSORES ===");
-  
-  for (int i = 0; i < 10; i++) {
-    readSensors();
-    Serial.print("Frente: ");
-    Serial.print(distanceFront);
-    Serial.print(" cm, Izquierda: ");
-    Serial.print(distanceLeft);
-    Serial.print(" cm, Derecha: ");
-    Serial.print(distanceRight);
-    Serial.println(" cm");
-    delay(500);
-  }
-  
-  Serial.println("=== CALIBRACIÓN COMPLETADA ===");
-}
-
-// Función para ajustar parámetros PID (opcional, para mejorar el control)
-void tunePID() {
-  // Esta función puede implementarse para ajustar los parámetros
-  // de control PID para mejor seguimiento de línea recta
-  // y giros más precisos
-}
