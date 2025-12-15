@@ -20,14 +20,14 @@
 #define ECHO_RIGHT A3
  
 const int MPU = 0x68;
-const int TURN_SPEED = 100;
-const int SPEED_NORMAL = 100;
+const int TURN_SPEED = 85;      // era 100
+const int SPEED_NORMAL = 80;    // era 100
 const int MOTOR_OFFSET = 5;
 const int FRONT_STOP = 8;
 const int MAX_SIDE_DISTANCE = 12;
  
 const int TURN_ANGLE = 38;
-const float CORRECTION_FACTOR = 3.0;
+const float CORRECTION_FACTOR = 3.5;  // era 3.0
  
 float yaw = 0;
 float gyroZ_offset = 0;
@@ -122,8 +122,8 @@ void driveForwardStraight() {
   int correccion = yaw * CORRECTION_FACTOR;
   int velIzq = SPEED_NORMAL + correccion;
   int velDer = (SPEED_NORMAL - MOTOR_OFFSET) - correccion;
-  velIzq = constrain(velIzq, 60, 150);
-  velDer = constrain(velDer, 60, 150);
+  velIzq = constrain(velIzq, 50, 120);  // era 60, 150
+  velDer = constrain(velDer, 50, 120);
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
   analogWrite(ENA, velIzq);
