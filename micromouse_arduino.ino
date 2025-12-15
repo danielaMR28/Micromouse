@@ -20,8 +20,8 @@
 #define ECHO_RIGHT A3
  
 const int MPU = 0x68;
-const int TURN_SPEED = 85;      // era 100
-const int SPEED_NORMAL = 80;    // era 100
+const int TURN_SPEED = 80;      // era 100
+const int SPEED_NORMAL = 75;    // era 100
 const int MOTOR_OFFSET = 5;
 const int FRONT_STOP = 8;
 const int MAX_SIDE_DISTANCE = 12;
